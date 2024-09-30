@@ -1,22 +1,34 @@
 namespace OpcPlc;
 
+using Configuration;
 using Microsoft.Extensions.Logging;
+using MQTTnet;
+using MQTTnet.Client;
+using MQTTnet.Client.Options;
 using Opc.Ua;
 using Opc.Ua.Server;
-using OpcPlc.Configuration;
-using OpcPlc.PluginNodes.Models;
+using PluginNodes.Models;
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Threading.Tasks;
 
 public class PlcNodeManager : CustomNodeManager2
 {
     private readonly OpcPlcConfiguration _config;
-    private readonly ImmutableList<IPluginNodes> _pluginNodes;
     private readonly ILogger _logger;
+    private readonly ImmutableList<IPluginNodes> _pluginNodes;
 
-    public PlcNodeManager(IServerInternal server, OpcPlcConfiguration config, ApplicationConfiguration appConfig, TimeService timeService, PlcSimulation plcSimulation, ImmutableList<IPluginNodes> pluginNodes, ILogger logger)
-        : base(server, appConfig, [Namespaces.OpcPlcApplications, Namespaces.OpcPlcBoiler, Namespaces.OpcPlcBoilerInstance,])
+    private readonly TimeService _timeService;
+    private IDictionary<NodeId, IList<IReference>> _externalReferences;
+    private Func<ISystemContext, NodeStateCollection> _loadPredefinedNodesHandler;
+    private IMqttClient _mqttClient;
+    private IMqttClientOptions _mqttOptions;
+
+    public PlcNodeManager(IServerInternal server, OpcPlcConfiguration config, ApplicationConfiguration appConfig,
+        TimeService timeService, PlcSimulation plcSimulation, ImmutableList<IPluginNodes> pluginNodes, ILogger logger)
+        : base(server, appConfig, Namespaces.OpcPlcApplications, Namespaces.OpcPlcBoiler,
+            Namespaces.OpcPlcBoilerInstance)
     {
         _config = config;
         _timeService = timeService;
@@ -29,24 +41,23 @@ public class PlcNodeManager : CustomNodeManager2
     public PlcSimulation PlcSimulationInstance { get; }
 
     /// <summary>
-    /// Creates the NodeId for the specified node.
+    ///     Creates the NodeId for the specified node.
     /// </summary>
     public override NodeId New(ISystemContext context, NodeState node)
     {
-        return node is BaseInstanceState instance &&
-               instance.Parent != null &&
+        return node is BaseInstanceState { Parent: not null } instance &&
                instance.Parent.NodeId.Identifier is string id
-                  ? new NodeId(id + "_" + instance.SymbolicName, instance.Parent.NodeId.NamespaceIndex)
-                  : node.NodeId;
+            ? new NodeId(id + "_" + instance.SymbolicName, instance.Parent.NodeId.NamespaceIndex)
+            : node.NodeId;
     }
 
     /// <summary>
-    /// Does any initialization required before the address space can be used.
+    ///     Does any initialization required before the address space can be used.
     /// </summary>
     /// <remarks>
-    /// The externalReferences is an out parameter that allows the node manager to link to nodes
-    /// in other node managers. For example, the 'Objects' node is managed by the CoreNodeManager and
-    /// should have a reference to the root folder node(s) exposed by this node manager.
+    ///     The externalReferences is an out parameter that allows the node manager to link to nodes
+    ///     in other node managers. For example, the 'Objects' node is managed by the CoreNodeManager and
+    ///     should have a reference to the root folder node(s) exposed by this node manager.
     /// </remarks>
     public override void CreateAddressSpace(IDictionary<NodeId, IList<IReference>> externalReferences)
     {
@@ -59,21 +70,23 @@ public class PlcNodeManager : CustomNodeManager2
 
             _externalReferences = externalReferences;
 
-            FolderState root = CreateFolder(parent: null, _config.ProgramName, _config.ProgramName, NamespaceType.OpcPlcApplications);
-            root.AddReference(ReferenceTypes.Organizes, isInverse: true, ObjectIds.ObjectsFolder);
-            references.Add(new NodeStateReference(ReferenceTypes.Organizes, isInverse: false, root.NodeId));
+            FolderState root = CreateFolder(null, _config.ProgramName, _config.ProgramName,
+                NamespaceType.OpcPlcApplications);
+            root.AddReference(ReferenceTypes.Organizes, true, ObjectIds.ObjectsFolder);
+            references.Add(new NodeStateReference(ReferenceTypes.Organizes, false, root.NodeId));
             root.EventNotifier = EventNotifiers.SubscribeToEvents;
             AddRootNotifier(root);
 
             try
             {
-                FolderState telemetryFolder = CreateFolder(root, "Telemetry", "Telemetry", NamespaceType.OpcPlcApplications);
+                FolderState telemetryFolder =
+                    CreateFolder(root, "Telemetry", "Telemetry", NamespaceType.OpcPlcApplications);
                 FolderState methodsFolder = CreateFolder(root, "Methods", "Methods", NamespaceType.OpcPlcApplications);
 
                 // Add nodes to address space from plugin nodes list.
-                foreach (var plugin in _pluginNodes)
+                foreach (IPluginNodes plugin in _pluginNodes)
                 {
-                    plugin.AddToAddressSpace(telemetryFolder, methodsFolder, plcNodeManager: this);
+                    plugin.AddToAddressSpace(telemetryFolder, methodsFolder, this);
                 }
             }
             catch (Exception e)
@@ -82,7 +95,85 @@ public class PlcNodeManager : CustomNodeManager2
             }
 
             AddPredefinedNode(SystemContext, root);
+
+            // Initialize MQTT client
+            InitializeMqttClient("test.mosquitto.org");
+
+            // Register the custom method node
+            CreateCustomMethodNode();
         }
+    }
+
+    private void InitializeMqttClient(string brokerAddress)
+    {
+        var factory = new MqttFactory();
+        _mqttClient = factory.CreateMqttClient();
+
+        _mqttOptions = new MqttClientOptionsBuilder()
+            .WithTcpServer(brokerAddress)
+            .Build();
+    }
+
+    private void CreateCustomMethodNode()
+    {
+        // Define the method node
+        var methodNode = new MethodState(null) {
+            NodeId = new NodeId("SendMqttMessages", NamespaceIndex),
+            BrowseName = new QualifiedName("SendMqttMessages", NamespaceIndex),
+            DisplayName = new LocalizedText("SendMqttMessages"),
+            Description = new LocalizedText("Send a specified number of MQTT messages."),
+            Executable = true,
+            UserExecutable = true
+        };
+
+        // Bind method event
+        methodNode.OnCallMethod = OnSendMqttMessages;
+
+        // Add the method node to the server
+        AddPredefinedNode(SystemContext, methodNode);
+    }
+
+    private ServiceResult OnSendMqttMessages(
+        ISystemContext context,
+        MethodState method,
+        IList<object> inputArguments,
+        IList<object> outputArguments)
+    {
+        if (inputArguments.Count >= 2 && inputArguments[0] is uint numberOfMessages &&
+            inputArguments[1] is uint sleepDurationMs)
+        {
+            Task.Run(async () => {
+                try
+                {
+                    if (!_mqttClient.IsConnected)
+                    {
+                        await _mqttClient.ConnectAsync(_mqttOptions).ConfigureAwait(false); // No context capturing
+                    }
+
+                    for (uint i = 0; i < numberOfMessages; i++)
+                    {
+                        MqttApplicationMessage message = new MqttApplicationMessageBuilder()
+                            .WithTopic("opcua/messages")
+                            .WithPayload($"Message {i + 1}")
+                            .Build();
+
+                        await _mqttClient.PublishAsync(message).ConfigureAwait(false); // No context capturing
+                        await Task.Delay((int)sleepDurationMs).ConfigureAwait(false); // No context capturing
+                    }
+
+                    outputArguments[0] = "MQTT messages sent successfully.";
+                }
+                catch (Exception ex)
+                {
+                    outputArguments[0] = $"Error sending MQTT messages: {ex.Message}";
+                }
+            });
+
+            return ServiceResult.Good;
+        }
+
+        // If the input arguments are not valid, return a "BadInvalidArgument" status.
+        return new ServiceResult(StatusCodes.BadInvalidArgument);
     }
 
     public SimulatedVariableNode<T> CreateVariableNode<T>(BaseDataVariableState variable)
@@ -91,11 +182,11 @@ public class PlcNodeManager : CustomNodeManager2
     }
 
     /// <summary>
-    /// Creates a new folder.
+    ///     Creates a new folder.
     /// </summary>
     public FolderState CreateFolder(NodeState parent, string path, string name, NamespaceType namespaceType)
     {
-        var existingFolder = parent?.FindChildBySymbolicName(SystemContext, name);
+        BaseInstanceState existingFolder = parent?.FindChildBySymbolicName(SystemContext, name);
         if (existingFolder != null)
         {
             return (FolderState)existingFolder;
@@ -103,8 +194,7 @@ public class PlcNodeManager : CustomNodeManager2
 
         ushort namespaceIndex = NamespaceIndexes[(int)namespaceType];
 
-        var folder = new FolderState(parent)
-        {
+        var folder = new FolderState(parent) {
             SymbolicName = name,
             ReferenceTypeId = ReferenceTypes.Organizes,
             TypeDefinitionId = ObjectTypeIds.FolderType,
@@ -113,7 +203,7 @@ public class PlcNodeManager : CustomNodeManager2
             DisplayName = new LocalizedText("en", name),
             WriteMask = AttributeWriteMask.None,
             UserWriteMask = AttributeWriteMask.None,
-            EventNotifier = EventNotifiers.None,
+            EventNotifier = EventNotifiers.None
         };
 
         parent?.AddChild(folder);
@@ -122,44 +212,48 @@ public class PlcNodeManager : CustomNodeManager2
     }
 
     /// <summary>
-    /// Creates a new extended variable.
+    ///     Creates a new extended variable.
     /// </summary>
-    public BaseDataVariableState CreateBaseVariable(NodeState parent, dynamic path, string name, NodeId dataType, int valueRank, byte accessLevel, string description, NamespaceType namespaceType, bool randomize, object stepSizeValue, object minTypeValue, object maxTypeValue, object defaultValue = null)
+    public BaseDataVariableState CreateBaseVariable(NodeState parent, dynamic path, string name, NodeId dataType,
+        int valueRank, byte accessLevel, string description, NamespaceType namespaceType, bool randomize,
+        object stepSizeValue, object minTypeValue, object maxTypeValue, object defaultValue = null)
     {
-        var baseDataVariableState = new BaseDataVariableStateExtended(parent, randomize, stepSizeValue, minTypeValue, maxTypeValue)
-        {
-            SymbolicName = name,
-            ReferenceTypeId = ReferenceTypes.Organizes,
-            TypeDefinitionId = VariableTypeIds.BaseDataVariableType,
-        };
+        var baseDataVariableState =
+            new BaseDataVariableStateExtended(parent, randomize, stepSizeValue, minTypeValue, maxTypeValue) {
+                SymbolicName = name,
+                ReferenceTypeId = ReferenceTypes.Organizes,
+                TypeDefinitionId = VariableTypeIds.BaseDataVariableType
+            };
 
-        return CreateBaseVariable(baseDataVariableState, parent, path, name, dataType, valueRank, accessLevel, description, namespaceType, defaultValue);
+        return CreateBaseVariable(baseDataVariableState, parent, path, name, dataType, valueRank, accessLevel,
+            description, namespaceType, defaultValue);
     }
 
     /// <summary>
-    /// Creates a new variable.
+    ///     Creates a new variable.
     /// </summary>
-    public BaseDataVariableState CreateBaseVariable(NodeState parent, dynamic path, string name, NodeId dataType, int valueRank, byte accessLevel, string description, NamespaceType namespaceType, object defaultValue = null)
+    public BaseDataVariableState CreateBaseVariable(NodeState parent, dynamic path, string name, NodeId dataType,
+        int valueRank, byte accessLevel, string description, NamespaceType namespaceType, object defaultValue = null)
     {
-        var baseDataVariableState = new BaseDataVariableState(parent)
-        {
+        var baseDataVariableState = new BaseDataVariableState(parent) {
             SymbolicName = name,
             ReferenceTypeId = ReferenceTypes.Organizes,
-            TypeDefinitionId = VariableTypeIds.BaseDataVariableType,
+            TypeDefinitionId = VariableTypeIds.BaseDataVariableType
         };
 
-        return CreateBaseVariable(baseDataVariableState, parent, path, name, dataType, valueRank, accessLevel, description, namespaceType, defaultValue);
+        return CreateBaseVariable(baseDataVariableState, parent, path, name, dataType, valueRank, accessLevel,
+            description, namespaceType, defaultValue);
     }
 
     /// <summary>
-    /// Creates a new method.
+    ///     Creates a new method.
     /// </summary>
-    public MethodState CreateMethod(NodeState parent, string path, string name, string description, NamespaceType namespaceType)
+    public MethodState CreateMethod(NodeState parent, string path, string name, string description,
+        NamespaceType namespaceType)
     {
         ushort namespaceIndex = NamespaceIndexes[(int)namespaceType];
 
-        var method = new MethodState(parent)
-        {
+        var method = new MethodState(parent) {
             SymbolicName = name,
             ReferenceTypeId = ReferenceTypeIds.HasComponent,
             NodeId = new NodeId(path, namespaceIndex),
@@ -169,7 +263,7 @@ public class PlcNodeManager : CustomNodeManager2
             UserWriteMask = AttributeWriteMask.None,
             Executable = true,
             UserExecutable = true,
-            Description = new LocalizedText(description),
+            Description = new LocalizedText(description)
         };
 
         parent?.AddChild(method);
@@ -177,7 +271,9 @@ public class PlcNodeManager : CustomNodeManager2
         return method;
     }
 
-    private BaseDataVariableState CreateBaseVariable(BaseDataVariableState baseDataVariableState, NodeState parent, dynamic path, string name, NodeId dataType, int valueRank, byte accessLevel, string description, NamespaceType namespaceType, object defaultValue = null)
+    private BaseDataVariableState CreateBaseVariable(BaseDataVariableState baseDataVariableState, NodeState parent,
+        dynamic path, string name, NodeId dataType, int valueRank, byte accessLevel, string description,
+        NamespaceType namespaceType, object defaultValue = null)
     {
         ushort namespaceIndex = NamespaceIndexes[(int)namespaceType];
 
@@ -226,7 +322,7 @@ public class PlcNodeManager : CustomNodeManager2
     }
 
     /// <summary>
-    /// Loads a predefined node set by using the specified handler.
+    ///     Loads a predefined node set by using the specified handler.
     /// </summary>
     public void LoadPredefinedNodes(Func<ISystemContext, NodeStateCollection> loadPredefinedNodesHandler)
     {
@@ -236,7 +332,7 @@ public class PlcNodeManager : CustomNodeManager2
     }
 
     /// <summary>
-    /// Adds a predefined node set.
+    ///     Adds a predefined node set.
     /// </summary>
     public void AddPredefinedNode(NodeState node)
     {
@@ -247,8 +343,4 @@ public class PlcNodeManager : CustomNodeManager2
     {
         return _loadPredefinedNodesHandler?.Invoke(context);
     }
-
-    private readonly TimeService _timeService;
-    private IDictionary<NodeId, IList<IReference>> _externalReferences;
-    private Func<ISystemContext, NodeStateCollection> _loadPredefinedNodesHandler;
 }

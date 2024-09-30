@@ -38,3 +38,6 @@
 *.cache
 CodeCoverage
 coverage.cobertura.xml
+.idea
+.vscode
+
